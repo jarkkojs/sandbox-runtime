@@ -26,6 +26,7 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@landstrip/landstrip": "0.18.35",
     "@pondwader/socks5-server": "^1.0.10",
     "commander": "^12.1.0",
     "node-forge": "^1.4.0",

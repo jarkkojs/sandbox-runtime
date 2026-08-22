@@ -22,6 +22,7 @@ import {
   disposeMitmCA,
   type MitmCA,
 } from './mitm-ca.js'
+import { binaryPath } from '@landstrip/landstrip'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
@@ -84,6 +85,12 @@ import {
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
 import {
+  cleanupLandstripPolicies,
+  getLandstripMandatoryDenyWrite,
+  quoteLandstripInvocation,
+  wrapCommandWithLandstrip,
+} from './landstrip-sandbox-utils.js'
+import {
   SandboxViolationStore,
   sanitizeViolationText,
   shouldIgnoreViolation,
@@ -101,7 +108,7 @@ import {
   matchesDomainPatternWithPort,
   stripDomainPatternPort,
 } from './domain-pattern.js'
-import type { ChildProcess } from 'node:child_process'
+import { spawnSync, type ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
@@ -117,7 +124,13 @@ interface HostNetworkManagerContext {
 // Private Module State
 // ============================================================================
 
+type SandboxBackend = 'landstrip' | 'legacy'
+
 let config: SandboxRuntimeConfig | undefined
+let sandboxBackend: SandboxBackend = 'legacy'
+let sandboxGeneration = 0
+let landstripExecutable: string | undefined
+let landstripSessionActive = false
 let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
@@ -179,16 +192,161 @@ const maskedFileStore = new MaskedFileStore()
 // Private Helper Functions (not exported)
 // ============================================================================
 
+function landstripUnavailableReason(): string | undefined {
+  let executable: string
+  try {
+    executable = binaryPath()
+  } catch (error) {
+    return (error as Error).message
+  }
+
+  if (!fs.existsSync(executable)) {
+    return `Landstrip binary not found: ${executable}`
+  }
+  if (landstripExecutable === executable) {
+    return undefined
+  }
+
+  const doctor = spawnSync(executable, ['doctor'], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    windowsHide: true,
+  })
+  if (doctor.error) {
+    return `Landstrip doctor failed: ${doctor.error.message}`
+  }
+  if (doctor.status !== 0) {
+    const detail = (doctor.stderr || doctor.stdout).trim()
+    return `Landstrip doctor reported an unhealthy sandbox${detail ? `: ${detail}` : ''}`
+  }
+
+  landstripExecutable = executable
+  return undefined
+}
+
+function landstripFallbackReason(
+  runtimeConfig: SandboxRuntimeConfig,
+  enableLogMonitor: boolean,
+): string | undefined {
+  const platform = getPlatform()
+  if (enableLogMonitor && (platform === 'linux' || platform === 'macos')) {
+    return 'sandbox violation monitoring requires the tagged legacy profile'
+  }
+
+  if (platform === 'linux') {
+    if (runtimeConfig.seccomp !== undefined) {
+      return 'custom seccomp configuration is not supported by Landstrip'
+    }
+    if (
+      runtimeConfig.bwrapPath !== undefined ||
+      runtimeConfig.socatPath !== undefined
+    ) {
+      return 'custom Linux sandbox tool paths require the legacy backend'
+    }
+    if (runtimeConfig.enableWeakerNestedSandbox) {
+      return 'enableWeakerNestedSandbox is specific to the legacy Linux sandbox'
+    }
+    if (
+      !runtimeConfig.filesystem.disabled &&
+      runtimeConfig.network.allowedDomains === undefined &&
+      !runtimeConfig.network.allowAllUnixSockets
+    ) {
+      return 'unrestricted TCP with blocked Unix sockets requires the legacy Linux backend'
+    }
+    if (
+      runtimeConfig.credentials?.files?.length ||
+      runtimeConfig.credentials?.envVars?.length
+    ) {
+      return 'credential restrictions require the legacy Linux PID namespace'
+    }
+  }
+
+  if (platform === 'macos') {
+    if (!runtimeConfig.enableWeakerNetworkIsolation) {
+      return "strict macOS Mach isolation does not allow Landstrip's trustd exception"
+    }
+    if (runtimeConfig.allowPty) {
+      return 'allowPty is not supported by Landstrip'
+    }
+    if (runtimeConfig.network.allowMachLookup?.length) {
+      return 'allowMachLookup is not supported by Landstrip'
+    }
+    if (runtimeConfig.allowAppleEvents) {
+      return 'allowAppleEvents is not supported by Landstrip'
+    }
+    if (!runtimeConfig.filesystem.disabled) {
+      return (
+        'filesystem restrictions require the legacy Seatbelt profile because ' +
+        "Landstrip 0.18.35 cannot preserve ASR's ancestor-move and symlink semantics"
+      )
+    }
+  }
+
+  if (platform === 'windows') {
+    return (
+      "Landstrip cannot preserve ASR's denylist-style Windows reads or " +
+      'mandatory missing-path write denials'
+    )
+  }
+
+  return undefined
+}
+
+function selectSandboxBackend(
+  runtimeConfig: SandboxRuntimeConfig,
+  enableLogMonitor: boolean,
+): void {
+  landstripSessionActive = false
+  const requiresLandstrip =
+    getPlatform() === 'linux' &&
+    !runtimeConfig.network.allowAllUnixSockets &&
+    (runtimeConfig.network.allowUnixSockets?.length ?? 0) > 0
+  const fallbackReason = landstripFallbackReason(
+    runtimeConfig,
+    enableLogMonitor,
+  )
+  if (fallbackReason !== undefined) {
+    if (requiresLandstrip) {
+      throw new Error(
+        `network.allowUnixSockets requires Landstrip and is incompatible with this configuration: ${fallbackReason}`,
+      )
+    }
+    sandboxBackend = 'legacy'
+    logForDebugging(`[Sandbox] Using legacy backend: ${fallbackReason}`)
+    return
+  }
+
+  const unavailableReason = landstripUnavailableReason()
+  if (unavailableReason !== undefined) {
+    if (requiresLandstrip) {
+      throw new Error(
+        `network.allowUnixSockets requires Landstrip: ${unavailableReason}`,
+      )
+    }
+    sandboxBackend = 'legacy'
+    logForDebugging(
+      `[Sandbox] Using legacy backend because Landstrip is unavailable: ${unavailableReason}`,
+    )
+    return
+  }
+
+  sandboxBackend = 'landstrip'
+  logForDebugging('[Sandbox] Using Landstrip backend')
+}
 function registerCleanup(): void {
   if (cleanupRegistered) {
     return
   }
-  const cleanupHandler = () =>
-    reset().catch(e => {
+  const cleanupHandler = () => {
+    // The process "exit" event cannot await reset(), so remove policy files
+    // synchronously before starting the rest of the best-effort teardown.
+    cleanupLandstripPolicies()
+    void reset().catch(e => {
       logForDebugging(`Cleanup failed in registerCleanup ${e}`, {
         level: 'error',
       })
     })
+  }
   process.once('exit', cleanupHandler)
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
@@ -607,10 +765,12 @@ async function initialize(
   // Return if already initializing
   if (initializationPromise) {
     await initializationPromise
+    landstripSessionActive = sandboxBackend === 'landstrip'
     return
   }
 
-  // Store config for use by other functions
+  selectSandboxBackend(runtimeConfig, enableLogMonitor)
+  // Store config for use by other functions only after backend selection succeeds.
   config = runtimeConfig
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
@@ -648,7 +808,7 @@ async function initialize(
       : undefined
 
   // Check dependencies
-  const deps = await checkDependenciesAsync()
+  const deps = await checkDependenciesAsync(undefined, sandboxBackend)
   if (deps.errors.length > 0) {
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
@@ -693,7 +853,7 @@ async function initialize(
   // sandboxed child can be spawned. Doing this at initialize() (not
   // wrap-time) means the host gets a single actionable error before
   // any per-exec work happens, instead of exit-15 on every command.
-  if (getPlatform() === 'windows') {
+  if (getPlatform() === 'windows' && sandboxBackend === 'legacy') {
     // Resolve once (stats disk); captured module-level for wrap/reset.
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
@@ -920,7 +1080,7 @@ async function initialize(
 
       // Initialize platform-specific infrastructure
       let linuxBridge: LinuxNetworkBridgeContext | undefined
-      if (getPlatform() === 'linux') {
+      if (getPlatform() === 'linux' && sandboxBackend === 'legacy') {
         linuxBridge = await initializeLinuxNetworkBridge(
           httpProxyPort,
           socksProxyPort,
@@ -950,6 +1110,7 @@ async function initialize(
   })()
 
   await initializationPromise
+  landstripSessionActive = sandboxBackend === 'landstrip'
 }
 
 function isSupportedPlatform(): boolean {
@@ -967,15 +1128,14 @@ function isSandboxingEnabled(): boolean {
 }
 
 /**
- * Platform-independent part of the dependency check. Returns either
- * a finished result (POSIX, unsupported platform, or a Windows
- * srt-win resolution failure) or the inputs for the Windows probe —
- * the only platform where the sync and async variants differ.
+ * Platform-independent dependency check. Returns either a finished result
+ * (Landstrip, POSIX legacy, unsupported platform, or a Windows legacy
+ * resolution failure) or the inputs for the asynchronous Windows probe.
  */
-function checkDependenciesCommon(ripgrepConfig?: {
-  command: string
-  args?: string[]
-}):
+function checkDependenciesCommon(
+  ripgrepConfig?: { command: string; args?: string[] },
+  backend?: SandboxBackend,
+):
   | { done: SandboxDependencyCheck }
   | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
   if (!isSupportedPlatform()) {
@@ -984,8 +1144,20 @@ function checkDependenciesCommon(ripgrepConfig?: {
 
   const errors: string[] = []
   const warnings: string[] = []
-
   const platform = getPlatform()
+  const effectiveBackend =
+    backend ?? (platform === 'linux' ? 'landstrip' : sandboxBackend)
+  const useLandstrip = effectiveBackend === 'landstrip'
+
+  if (useLandstrip) {
+    const unavailableReason = landstripUnavailableReason()
+    if (unavailableReason === undefined) {
+      return { done: { errors, warnings } }
+    }
+    warnings.push(
+      `Landstrip is unavailable; checking the legacy backend: ${unavailableReason}`,
+    )
+  }
   if (platform === 'linux') {
     // ripgrep is Linux-only: it's used by linuxGetMandatoryDenyPaths() to
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
@@ -1027,27 +1199,24 @@ function checkDependenciesCommon(ripgrepConfig?: {
  * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
  * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
  */
-function checkDependencies(ripgrepConfig?: {
-  command: string
-  args?: string[]
-}): SandboxDependencyCheck {
-  const common = checkDependenciesCommon(ripgrepConfig)
+function checkDependencies(
+  ripgrepConfig?: { command: string; args?: string[] },
+  backend?: SandboxBackend,
+): SandboxDependencyCheck {
+  const common = checkDependenciesCommon(ripgrepConfig, backend)
   if ('done' in common) return common.done
   return checkWindowsDependencies(common.windows)
 }
 
 /**
- * Async variant of {@link checkDependencies} — same result for the
- * same underlying state. On Windows the srt-win probes run via
- * `spawn` (never blocking the event loop) and concurrently; on other
- * platforms the checks are native and this simply wraps the sync
- * result. Windows callers should prefer this variant.
+ * Async variant of {@link checkDependencies}. Legacy Windows probes run
+ * without blocking the event loop; POSIX checks are local.
  */
-async function checkDependenciesAsync(ripgrepConfig?: {
-  command: string
-  args?: string[]
-}): Promise<SandboxDependencyCheck> {
-  const common = checkDependenciesCommon(ripgrepConfig)
+async function checkDependenciesAsync(
+  ripgrepConfig?: { command: string; args?: string[] },
+  backend?: SandboxBackend,
+): Promise<SandboxDependencyCheck> {
+  const common = checkDependenciesCommon(ripgrepConfig, backend)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
 }
@@ -1165,6 +1334,55 @@ function unionDenyReadPaths(
   return [...new Set([...denyRead, ...credentialRestrictions.denyReadPaths])]
 }
 
+function normalizeReadGlobs(
+  paths: readonly string[],
+  label: 'denyRead' | 'allowRead',
+): string[] {
+  const normalized: string[] = []
+  for (const path of paths) {
+    const stripped = removeTrailingGlobSuffix(path)
+    if (
+      sandboxBackend === 'legacy' &&
+      getPlatform() === 'linux' &&
+      containsGlobChars(stripped)
+    ) {
+      const expanded = expandGlobPattern(path)
+      logForDebugging(
+        `[Sandbox] Expanded ${label} glob pattern "${path}" to ${expanded.length} paths on Linux`,
+      )
+      normalized.push(...expanded)
+    } else {
+      normalized.push(stripped)
+    }
+  }
+  return normalized
+}
+
+function normalizeWriteGlobs(
+  paths: readonly string[],
+  preserveLandstripDenyGlobs = false,
+): string[] {
+  return paths
+    .map(path =>
+      preserveLandstripDenyGlobs && sandboxBackend === 'landstrip'
+        ? path
+        : removeTrailingGlobSuffix(path),
+    )
+    .filter(path => {
+      if (
+        sandboxBackend === 'legacy' &&
+        getPlatform() === 'linux' &&
+        containsGlobChars(path)
+      ) {
+        logForDebugging(
+          `[Sandbox] Skipping glob write pattern on Linux: ${path}`,
+        )
+        return false
+      }
+      return true
+    })
+}
+
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
     return { denyOnly: [], allowWithinDeny: [] }
@@ -1180,35 +1398,11 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     ),
   )
 
-  const denyPaths: string[] = []
-  for (const p of rawDenyRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      // Expand glob to concrete paths on Linux (bubblewrap doesn't support globs)
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      denyPaths.push(...expanded)
-    } else {
-      denyPaths.push(stripped)
-    }
-  }
-
-  // Process allowRead paths (re-allow within denied regions)
-  const allowPaths: string[] = []
-  for (const p of config.filesystem.allowRead ?? []) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      allowPaths.push(...expanded)
-    } else {
-      allowPaths.push(stripped)
-    }
-  }
+  const denyPaths = normalizeReadGlobs(rawDenyRead, 'denyRead')
+  const allowPaths = normalizeReadGlobs(
+    config.filesystem.allowRead ?? [],
+    'allowRead',
+  )
 
   return {
     denyOnly: denyPaths,
@@ -1225,27 +1419,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: ['/'], denyWithinAllow: [] }
   }
 
-  // Filter out glob patterns on Linux/WSL for allowWrite (bubblewrap doesn't support globs)
-  const allowPaths = config.filesystem.allowWrite
-    .map(path => removeTrailingGlobSuffix(path))
-    .filter(path => {
-      if (getPlatform() === 'linux' && containsGlobChars(path)) {
-        logForDebugging(`Skipping glob pattern on Linux/WSL: ${path}`)
-        return false
-      }
-      return true
-    })
-
-  // Filter out glob patterns on Linux/WSL for denyWrite (bubblewrap doesn't support globs)
-  const denyPaths = config.filesystem.denyWrite
-    .map(path => removeTrailingGlobSuffix(path))
-    .filter(path => {
-      if (getPlatform() === 'linux' && containsGlobChars(path)) {
-        logForDebugging(`Skipping glob pattern on Linux/WSL: ${path}`)
-        return false
-      }
-      return true
-    })
+  const allowPaths = normalizeWriteGlobs(config.filesystem.allowWrite)
+  const denyPaths = normalizeWriteGlobs(config.filesystem.denyWrite, true)
 
   // Build allowOnly list: default paths + configured allow paths
   const allowOnly = [...getDefaultWritePaths(), ...allowPaths]
@@ -1516,16 +1691,100 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
+function mergeLandstripRuntimeConfig(
+  base: SandboxRuntimeConfig,
+  override: Partial<SandboxRuntimeConfig> | undefined,
+): SandboxRuntimeConfig {
+  const network = override?.network
+  const filesystem = override?.filesystem
+  return {
+    ...base,
+    ...override,
+    credentials: override?.credentials ?? base.credentials,
+    enableWeakerNetworkIsolation:
+      override?.enableWeakerNetworkIsolation ??
+      base.enableWeakerNetworkIsolation,
+    allowPty: override?.allowPty ?? base.allowPty,
+    allowAppleEvents: override?.allowAppleEvents ?? base.allowAppleEvents,
+    network:
+      network === undefined
+        ? base.network
+        : {
+            ...base.network,
+            ...network,
+            allowedDomains:
+              network.allowedDomains ?? base.network.allowedDomains,
+            deniedDomains: network.deniedDomains ?? base.network.deniedDomains,
+            allowLocalBinding:
+              network.allowLocalBinding ?? base.network.allowLocalBinding,
+            allowUnixSockets:
+              network.allowUnixSockets ?? base.network.allowUnixSockets,
+            allowAllUnixSockets:
+              network.allowAllUnixSockets ?? base.network.allowAllUnixSockets,
+            allowMachLookup:
+              network.allowMachLookup ?? base.network.allowMachLookup,
+          },
+    filesystem:
+      filesystem === undefined
+        ? base.filesystem
+        : {
+            ...base.filesystem,
+            ...filesystem,
+            disabled: filesystem.disabled ?? false,
+            denyRead: filesystem.denyRead ?? base.filesystem.denyRead,
+            allowRead: filesystem.allowRead ?? base.filesystem.allowRead,
+            allowWrite: filesystem.allowWrite ?? base.filesystem.allowWrite,
+            denyWrite: filesystem.denyWrite ?? base.filesystem.denyWrite,
+            allowGitConfig:
+              filesystem.allowGitConfig ?? base.filesystem.allowGitConfig,
+          },
+  }
+}
+
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
   options?: WrapWithSandboxOptions,
+  cwd = process.cwd(),
 ): Promise<string> {
   const platform = getPlatform()
+  const allowUnixSockets =
+    customConfig?.network?.allowUnixSockets ?? config?.network.allowUnixSockets
+  const allowAllUnixSockets =
+    customConfig?.network?.allowAllUnixSockets ??
+    config?.network.allowAllUnixSockets
+  if (
+    platform === 'linux' &&
+    sandboxBackend === 'legacy' &&
+    !allowAllUnixSockets &&
+    (allowUnixSockets?.length ?? 0) > 0
+  ) {
+    throw new Error(
+      'network.allowUnixSockets requires reset() and initialize() with a Landstrip-compatible configuration',
+    )
+  }
+  const generation = sandboxGeneration
   const commandId = options?.commandId
   registerCommandText(command, options)
+  const landstripConfig =
+    sandboxBackend === 'landstrip' && config !== undefined
+      ? mergeLandstripRuntimeConfig(config, customConfig)
+      : undefined
+  if (sandboxBackend === 'landstrip') {
+    if (!landstripSessionActive || landstripConfig === undefined) {
+      throw new Error(
+        'SandboxManager.initialize() must be called before wrapping',
+      )
+    }
+    const fallbackReason = landstripFallbackReason(landstripConfig, false)
+    if (fallbackReason !== undefined) {
+      throw new Error(
+        `Updated sandbox configuration requires reset() and initialize(): ${fallbackReason}`,
+      )
+    }
+  }
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1553,35 +1812,24 @@ async function wrapWithSandbox(
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
   //
-  // Strip trailing /** and filter remaining globs on Linux (bwrap needs
-  // real paths, not globs; macOS subpath matching is also recursive so
-  // stripping is harmless there).
+  // Normalize recursive allow roots for every backend. Keep Landstrip deny
+  // globs intact so its syscall-time matcher also covers paths created later;
+  // the legacy wrappers need concrete recursive roots instead.
   let writeConfig: FsWriteRestrictionConfig | undefined
   let readConfig: FsReadRestrictionConfig | undefined
   if (!fsDisabled) {
-    const stripWriteGlobs = (paths: string[]): string[] =>
-      paths
-        .map(p => removeTrailingGlobSuffix(p))
-        .filter(p => {
-          if (getPlatform() === 'linux' && containsGlobChars(p)) {
-            logForDebugging(
-              `[Sandbox] Skipping glob write pattern on Linux: ${p}`,
-            )
-            return false
-          }
-          return true
-        })
-    const userAllowWrite = stripWriteGlobs(
+    const userAllowWrite = normalizeWriteGlobs(
       customConfig?.filesystem?.allowWrite ??
         config?.filesystem.allowWrite ??
         [],
     )
     writeConfig = {
       allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-      denyWithinAllow: stripWriteGlobs(
+      denyWithinAllow: normalizeWriteGlobs(
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
           [],
+        true,
       ),
     }
 
@@ -1591,26 +1839,11 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
       credentialRestrictions,
     )
-    const expandedDenyRead: string[] = []
-    for (const p of rawDenyRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedDenyRead.push(...expandGlobPattern(p))
-      } else {
-        expandedDenyRead.push(stripped)
-      }
-    }
-    const rawAllowRead =
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
-    const expandedAllowRead: string[] = []
-    for (const p of rawAllowRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedAllowRead.push(...expandGlobPattern(p))
-      } else {
-        expandedAllowRead.push(stripped)
-      }
-    }
+    const expandedDenyRead = normalizeReadGlobs(rawDenyRead, 'denyRead')
+    const expandedAllowRead = normalizeReadGlobs(
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+      'allowRead',
+    )
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
     // paths fall under a user-configured denyRead.
@@ -1655,6 +1888,54 @@ async function wrapWithSandbox(
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
   const gitSafeDirectories = getGitSafeDirectories(customConfig)
+
+  if (landstripConfig !== undefined) {
+    if (generation !== sandboxGeneration) {
+      throw new Error('Sandbox was reset while wrapping the command')
+    }
+    if (platform !== 'linux' && platform !== 'macos') {
+      throw new Error(`Landstrip backend is not supported on ${platform}`)
+    }
+    const shellName = binShell || 'bash'
+    const shellPath = whichSync(shellName)
+    if (shellPath === null) {
+      throw new Error(`Shell '${shellName}' not found in PATH`)
+    }
+    return quoteLandstripInvocation(
+      wrapCommandWithLandstrip({
+        landstripPath: (landstripExecutable ??= binaryPath()),
+        command,
+        commandId,
+        platform,
+        cwd,
+        shell: { exe: shellPath, args: ['-c'] },
+        needsNetworkRestriction,
+        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+        caCertPath: mitmCA?.trustBundlePath,
+        javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
+        allowLocalBinding: landstripConfig.network.allowLocalBinding,
+        allowUnixSockets: landstripConfig.network.allowUnixSockets,
+        allowAllUnixSockets: landstripConfig.network.allowAllUnixSockets,
+        readConfig,
+        writeConfig,
+        mandatoryDenyWrite:
+          writeConfig === undefined
+            ? []
+            : getLandstripMandatoryDenyWrite(
+                cwd,
+                landstripConfig.filesystem.allowGitConfig ?? false,
+              ),
+        maskedFileBinds: fsDisabled
+          ? []
+          : credentialRestrictions.maskedFileBinds,
+        unsetEnvVars: credentialRestrictions.unsetEnvVars,
+        setEnvVars: credentialRestrictions.setEnvVars,
+        gitSafeDirectories,
+      }),
+    )
+  }
 
   switch (platform) {
     case 'macos':
@@ -1752,21 +2033,12 @@ async function wrapWithSandbox(
  * `{ argv, env }`, suitable for
  * `spawn(argv[0], argv.slice(1), {shell: false, env})`.
  *
- * On Windows this is the ONLY supported wrap method (see
- * {@link wrapWithSandbox}); `env` is the broker process's spawn env
- * — the sandboxed child gets a fresh `srt-sandbox` profile env with
- * only the `--env` overlay baked into `argv` (see
- * {@link wrapCommandWithSandboxWindows}). On
- * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
- * (proxy env is baked into that command) and `env` is the unchanged
- * `process.env`, so callers can spawn uniformly across platforms.
+ * On Windows this returns the srt-win broker descriptor. On macOS/Linux,
+ * including Landstrip, `argv` is `[binShell, '-c', <wrapped command>]`.
  *
- * @param cwd the working directory the caller will spawn the result
- *   with. On Windows the child's cwd is whatever the caller passes
- *   as the spawn `{cwd:}` option (there is no `--cwd` flag), and
- *   the `safe.directory` git-config injection derives from this — so
- *   pass the same value here as to `spawn({cwd})`. Defaults to
- *   `process.cwd()`. Currently unused on macOS/Linux.
+ * @param cwd the working directory the caller will pass to `spawn`. It is
+ *   also the base for Landstrip's relative policy paths and git safe-directory
+ *   injection. Defaults to `process.cwd()`.
  */
 async function wrapWithSandboxArgv(
   command: string,
@@ -1892,6 +2164,7 @@ async function wrapWithSandboxArgv(
     customConfig,
     abortSignal,
     options,
+    cwd ?? process.cwd(),
   )
   const shell = binShell ?? '/bin/bash'
   return { argv: [shell, '-c', wrapped], env: process.env }
@@ -1916,17 +2189,16 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * including Windows. This is what lets a host enable/deny domains
  * for already-running sandboxed children.
  *
- * Filesystem changes (denyRead/denyWrite) are NOT applied live:
- * macOS bakes them into the seatbelt profile at wrap time, and
- * Linux/Windows bake them into the bwrap argv / DENY-ACE set at
- * wrap time. Call reset() + initialize() to apply a new
- * filesystem config.
+ * Filesystem changes do not affect already-running children. Landstrip and
+ * the POSIX legacy wrappers apply them to the next wrapped process; legacy
+ * Windows session ACL changes require reset() + initialize().
  *
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
   if (
     getPlatform() === 'windows' &&
+    sandboxBackend === 'legacy' &&
     config &&
     !sameWindowsStampSet(newConfig)
   ) {
@@ -2079,6 +2351,9 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  landstripSessionActive = false
+  sandboxGeneration += 1
+  cleanupLandstripPolicies()
   // Windows: release this session's sandbox-user ACEs. Best-effort
   // — log anomalies rather than throw, so teardown always
   // completes. Leftover ACEs are recoverable later via
@@ -2226,7 +2501,6 @@ function annotateStderrWithSandboxFailures(
   if (!config) {
     return stderr
   }
-
   const violations = sandboxViolationStore.getViolationsForCommand(command)
   if (violations.length === 0) {
     return stderr
@@ -2243,16 +2517,18 @@ function annotateStderrWithSandboxFailures(
 }
 
 /**
- * Returns glob patterns from Edit/Read permission rules that are not
- * fully supported on Linux. Returns empty array on macOS or when
- * sandboxing is disabled.
- *
- * Patterns ending with /** are excluded since they work as subpaths.
+ * Returns glob patterns that the legacy Linux bubblewrap backend cannot fully
+ * enforce. Landstrip supports them and returns no warnings.
  */
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)
   // macOS supports glob patterns via regex conversion
-  if (getPlatform() !== 'linux' || !config || config.filesystem.disabled) {
+  if (
+    sandboxBackend === 'landstrip' ||
+    getPlatform() !== 'linux' ||
+    !config ||
+    config.filesystem.disabled
+  ) {
     return []
   }
 
